@@ -1,0 +1,58 @@
+name: Build OpenFOAM 14 for macOS
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Prepare macOS build volume
+        run: |
+          brew install cmake make
+          mkdir -p "$RUNNER_TEMP/openfoam-14"
+          hdiutil create -size 30g -type SPARSEBUNDLE -fs 'Case-sensitive APFS' -volname OpenFOAM14-build "$RUNNER_TEMP/OpenFOAM14-build.sparsebundle"
+          hdiutil attach -nobrowse "$RUNNER_TEMP/OpenFOAM14-build.sparsebundle"
+
+      - name: Build and package
+        run: |
+          out="$RUNNER_TEMP/openfoam-14"
+          scripts/build.sh /Volumes/OpenFOAM14-build 3 2>&1 | tee "$out/build.log"
+          scripts/package.sh /Volumes/OpenFOAM14-build "$out" 0.1.0 2>&1 | tee "$out/package.log"
+
+      - name: Test serial and MPI cavity runs
+        run: |
+          out="$RUNNER_TEMP/openfoam-14"
+          launcher="$out/OpenFOAM-14.app/Contents/Resources/openfoam-14"
+          scripts/smoke-test.sh "$launcher" "$out"
+          "$launcher" --eject
+          ditto -c -k --keepParent "$out/OpenFOAM-14.app" "$out/openfoam-14-0.1.0-arm64.zip"
+
+      - name: Save build and case logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: openfoam-14-logs
+          path: |
+            ${{ runner.temp }}/openfoam-14/*.log
+            ${{ runner.temp }}/openfoam-14/cavity.*/**/log.*
+          if-no-files-found: ignore
+
+      - name: Save the tested app
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: openfoam-14-macos-development
+          path: ${{ runner.temp }}/openfoam-14/openfoam-14-0.1.0-arm64.zip

@@ -1,0 +1,559 @@
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..dbac271
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,12 @@
++# wmake-generated build artifacts
++lnInclude/
++Make/linux64*/
++Make/linuxArm64*/
++Make/darwin64*/
++Make/darwinArm64*/
++*.o
++*.dep
++*.dylib
++*.so
++*.exe
++*.exe.dSYM/
+diff --git a/Allwmake b/Allwmake
+index d766775..1a5f98b 100755
+--- a/Allwmake
++++ b/Allwmake
+@@ -6,4 +6,24 @@ wmake libso meshLibrary
+ wmake all executables
+ 
+ # Compile utilities
+-wmake all utilities
++#
++# NOTE: importSurfaceAsSubset and extrudeEdgesInto2DSurface are not
++# buildable from the 1.2.0 release sources (their headers
++# triSurfaceImportSurfaceAsSubset.H / triSurfaceExtrude2DEdges.H are
++# missing from the distribution), so they are skipped.  This is a
++# platform-independent workaround (Linux, macOS, Windows/mingw).
++for _util in utilities/*/Make
++do
++    _dir=${_util%/Make}
++    case ${_dir##*/} in
++    importSurfaceAsSubset|extrudeEdgesInto2DSurface)
++        echo "cfMesh: skipping ${_dir##*/} (missing source header in 1.2.0 release)"
++        ;;
++    *)
++        wmake all "$_dir" || exit 1
++        ;;
++    esac
++done
++unset _util _dir
++
++#------------------------------------------------------------------------------
+diff --git a/meshLibrary/Make/options b/meshLibrary/Make/options
+index a68799f..b884073 100644
+--- a/meshLibrary/Make/options
++++ b/meshLibrary/Make/options
+@@ -1,9 +1,21 @@
+ ifeq (Gcc,$(findstring Gcc,$(WM_COMPILER)))
+     OMP_FLAGS = -DUSE_OMP -fopenmp
++    OMP_LIBS  =
+ else ifeq (Clang,$(findstring Clang,$(WM_COMPILER)))
+-    OMP_FLAGS = -DUSE_OMP -fopenmp
++    ifeq ($(shell uname -s),Darwin)
++        # macOS (Apple clang): OpenMP is not supported by the system
++        # clang (no -fopenmp option).  Build cfMesh serial instead;
++        # this is only a performance option, not a functional one.
++        # Linux and Windows/mingw keep the -fopenmp path below.
++        OMP_FLAGS =
++        OMP_LIBS  =
++    else
++        OMP_FLAGS = -DUSE_OMP -fopenmp
++        OMP_LIBS  =
++    endif
+ else
+     OMP_FLAGS =
++    OMP_LIBS  =
+ endif
+ 
+ ifeq (OpenFOAM,$(findstring OpenFOAM,$(WM_PROJECT)))
+@@ -37,4 +49,4 @@ EXE_INC = \
+     -I$(LIB_SRC)/edgeMesh/lnInclude \
+     -I$(LIB_SRC)/meshTools/lnInclude
+ 
+-LIB_LIBS = $(LIBS)
++LIB_LIBS = $(LIBS) $(OMP_LIBS)
+diff --git a/meshLibrary/utilities/boundaryLayers/boundaryLayers/boundaryLayers.C b/meshLibrary/utilities/boundaryLayers/boundaryLayers/boundaryLayers.C
+index ca53d16..8e5c15d 100644
+--- a/meshLibrary/utilities/boundaryLayers/boundaryLayers/boundaryLayers.C
++++ b/meshLibrary/utilities/boundaryLayers/boundaryLayers/boundaryLayers.C
+@@ -374,7 +374,7 @@ void boundaryLayers::findPatchesToBeTreatedTogether()
+         forAll(flattenedPatches, i)
+             procPatches[Pstream::myProcNo()][i] = flattenedPatches[i];
+         Pstream::gatherList(procPatches);
+-        Pstream::broadcastList(procPatches);
++        Pstream::scatter(procPatches);
+ 
+         forAll(procPatches, procI)
+         {
+diff --git a/meshLibrary/utilities/boundaryLayers/refineBoundaryLayers/refineBoundaryLayersFunctions.C b/meshLibrary/utilities/boundaryLayers/refineBoundaryLayers/refineBoundaryLayersFunctions.C
+index b39b6b1..65aa73d 100644
+--- a/meshLibrary/utilities/boundaryLayers/refineBoundaryLayers/refineBoundaryLayersFunctions.C
++++ b/meshLibrary/utilities/boundaryLayers/refineBoundaryLayers/refineBoundaryLayersFunctions.C
+@@ -276,7 +276,11 @@ bool refineBoundaryLayers::analyseLayers()
+     }
+ 
+     //- perform reduction over all processors
+-    reduce(nLayersAtPatch, maxOp<labelList>());
++    //  OpenFOAM-14: element-wise list reduction via
++    //  listCombineGather/listCombineScatter instead of
++    //  reduce(list, maxOp<labelList>())
++    Pstream::listCombineGather(nLayersAtPatch, maxOp<label>());
++    Pstream::listCombineScatter(nLayersAtPatch);
+ 
+     # ifdef DEBUGLayer
+     Pout << "nLayersAtPatch " << nLayersAtPatch << endl;
+diff --git a/meshLibrary/utilities/checkMeshDict/checkMeshDict.C b/meshLibrary/utilities/checkMeshDict/checkMeshDict.C
+index 65c9cae..b1168fa 100644
+--- a/meshLibrary/utilities/checkMeshDict/checkMeshDict.C
++++ b/meshLibrary/utilities/checkMeshDict/checkMeshDict.C
+@@ -26,6 +26,7 @@ Description
+ \*---------------------------------------------------------------------------*/
+ 
+ #include "checkMeshDict.H"
++#include "OSspecific.H"
+ #include "patchRefinementList.H"
+ #include "PtrList.H"
+ #include "LongList.H"
+@@ -285,7 +286,7 @@ void checkMeshDict::checkObjectRefinements() const
+             forAll(refObjects, objectI)
+             {
+                 const entry& objectEntry =
+-                    dict.lookupEntry(objectNames[objectI], keyType::REGEX);
++                    dict.lookupEntry(objectNames[objectI], false, true);
+ 
+                 refObjects.set
+                 (
+@@ -349,7 +350,7 @@ void checkMeshDict::checkAnisotropicSources() const
+             forAll(anisotropicObjects, objectI)
+             {
+                 const entry& objectEntry =
+-                    dict.lookupEntry(objectNames[objectI], keyType::REGEX);
++                    dict.lookupEntry(objectNames[objectI], false, true);
+ 
+                 anisotropicObjects.set
+                 (
+diff --git a/meshLibrary/utilities/containers/DynList/DynList.H b/meshLibrary/utilities/containers/DynList/DynList.H
+index 8cf6d46..81e5358 100644
+--- a/meshLibrary/utilities/containers/DynList/DynList.H
++++ b/meshLibrary/utilities/containers/DynList/DynList.H
+@@ -42,6 +42,7 @@ SourceFiles
+ #define DynList_H
+ 
+ #include "UList.H"
++#include "contiguous.H"
+ 
+ // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+ 
+diff --git a/meshLibrary/utilities/containers/DynList/DynListI.H b/meshLibrary/utilities/containers/DynList/DynListI.H
+index 6c4f515..3f9e251 100644
+--- a/meshLibrary/utilities/containers/DynList/DynListI.H
++++ b/meshLibrary/utilities/containers/DynList/DynListI.H
+@@ -248,7 +248,7 @@ inline Foam::label Foam::DynList<T, staticSize>::byteSize() const
+     checkAllocation();
+     # endif
+ 
+-    if( !is_contiguous<T>() )
++    if( !contiguous<T>() )
+     {
+         FatalErrorIn("DynList<T>::byteSize()")
+             << "Cannot return the binary size of a list of "
+diff --git a/meshLibrary/utilities/containers/LongList/LongList.C b/meshLibrary/utilities/containers/LongList/LongList.C
+index a4c6d83..f472d53 100644
+--- a/meshLibrary/utilities/containers/LongList/LongList.C
++++ b/meshLibrary/utilities/containers/LongList/LongList.C
+@@ -26,6 +26,7 @@ License
+ #include "LongList.H"
+ #include "Ostream.H"
+ #include "token.H"
++#include "contiguous.H"
+ 
+ // * * * * * * * * * * * * * * * IOstream Operators  * * * * * * * * * * * * //
+ 
+@@ -66,7 +67,7 @@ Foam::Ostream& Foam::operator<<
+     const Foam::LongList<T, Offset>& DL
+ )
+ {
+-    if( (os.format() == IOstream::ASCII) || !is_contiguous<T>() )
++    if( (os.format() == IOstream::ASCII) || !contiguous<T>() )
+     {
+         if( DL.size() < 15 )
+         {
+@@ -159,7 +160,7 @@ Foam::Istream& Foam::operator>>
+         DL.setSize(size);
+ 
+         // Read list contents depending on data format
+-        if( (is.format() == IOstream::ASCII) || !is_contiguous<T>() )
++        if( (is.format() == IOstream::ASCII) || !contiguous<T>() )
+         {
+             // Read beginning of contents
+             char listDelimiter = is.readBeginList("List");
+@@ -299,7 +300,7 @@ void Foam::LongList<T, Offset>::appendFromStream(Istream& is)
+         setSize(origSize+size);
+ 
+         // Read list contents depending on data format
+-        if( (is.format() == IOstream::ASCII) || !is_contiguous<T>() )
++        if( (is.format() == IOstream::ASCII) || !contiguous<T>() )
+         {
+             // Read beginning of contents
+             char listDelimiter = is.readBeginList("List");
+diff --git a/meshLibrary/utilities/containers/LongList/LongListI.H b/meshLibrary/utilities/containers/LongList/LongListI.H
+index 80a9c74..122ad3c 100644
+--- a/meshLibrary/utilities/containers/LongList/LongListI.H
++++ b/meshLibrary/utilities/containers/LongList/LongListI.H
+@@ -208,7 +208,7 @@ inline Foam::label Foam::LongList<T, Offset>::size() const
+ template<class T, Foam::label Offset>
+ inline Foam::label Foam::LongList<T, Offset>::byteSize() const
+ {
+-    if( !is_contiguous<T>() )
++    if( !contiguous<T>() )
+     {
+         FatalErrorIn("LongList<T, Offset>::byteSize()")
+             << "Cannot return the binary size of a list of "
+diff --git a/meshLibrary/utilities/dataConversion/foamToFPMA/writeMeshFPMA.C b/meshLibrary/utilities/dataConversion/foamToFPMA/writeMeshFPMA.C
+index 1b4ce10..58e2156 100644
+--- a/meshLibrary/utilities/dataConversion/foamToFPMA/writeMeshFPMA.C
++++ b/meshLibrary/utilities/dataConversion/foamToFPMA/writeMeshFPMA.C
+@@ -31,6 +31,7 @@ Description
+ #include "OFstream.H"
+ #include "IOmanip.H"
+ #include "fileName.H"
++#include "OSspecific.H"
+ 
+ #include "fpmaMesh.H"
+ #include "writeMeshFPMA.H"
+diff --git a/meshLibrary/utilities/helperFunctions/helperFunctionsFrontalMarking.C b/meshLibrary/utilities/helperFunctions/helperFunctionsFrontalMarking.C
+index b110c95..5bf79ee 100644
+--- a/meshLibrary/utilities/helperFunctions/helperFunctionsFrontalMarking.C
++++ b/meshLibrary/utilities/helperFunctions/helperFunctionsFrontalMarking.C
+@@ -362,7 +362,7 @@ label groupMarking
+         nGroupsAtProc[Pstream::myProcNo()] = nGroups;
+ 
+         Pstream::gatherList(nGroupsAtProc);
+-        Pstream::broadcastList(nGroupsAtProc);
++        Pstream::scatter(nGroupsAtProc);
+ 
+         label startGroup(0), totalNumGroups(0);
+         for(label procI=0;procI<Pstream::nProcs();++procI)
+@@ -468,8 +468,8 @@ label groupMarking
+         }
+ 
+         //- broadcast group labels from the master to other processors
+-        Pstream::broadcast(nGroups);
+-        Pstream::broadcast(allGroupsNewLabel);
++        Pstream::scatter(nGroups);
++        Pstream::scatter(allGroupsNewLabel);
+ 
+         //- assign correct group labels
+         forAll(globalGroupLabel, groupI)
+diff --git a/meshLibrary/utilities/helperFunctions/helperFunctionsGeometryQueriesI.H b/meshLibrary/utilities/helperFunctions/helperFunctionsGeometryQueriesI.H
+index 013bb81..860f2fa 100644
+--- a/meshLibrary/utilities/helperFunctions/helperFunctionsGeometryQueriesI.H
++++ b/meshLibrary/utilities/helperFunctions/helperFunctionsGeometryQueriesI.H
+@@ -128,7 +128,7 @@ inline vector faceAreaVector(const FacePts& f)
+         fCentre += p;
+     }
+ 
+-    fCentre /= nPoints;
++    fCentre /= scalar(nPoints);
+ 
+     for(std::size_t i = 0; i < nPoints; ++i)
+     {
+@@ -194,7 +194,7 @@ inline vector faceAreaVector(const PointField& pts, const Face& f)
+         fCentre += pts[pointI];
+     }
+ 
+-    fCentre /= nPoints;
++    fCentre /= scalar(nPoints);
+ 
+     for(std::size_t i = 0; i < nPoints; ++i)
+     {
+@@ -1922,7 +1922,7 @@ inline scalar tetQuality(const tetrahedron<point, point>& tet)
+             tet.mag()
+            /(
+                 8.0/(9.0*sqrt(3.0))
+-               *pow3(min(tet.circumRadius(), GREAT))
++               *pow3(min(tet.circumSphere().second(), GREAT))
+               + ROOTVSMALL
+             );
+ }
+diff --git a/meshLibrary/utilities/meshes/partTetMesh/partTetMeshParallelAddressing.C b/meshLibrary/utilities/meshes/partTetMesh/partTetMeshParallelAddressing.C
+index 63fcecd..8175b9c 100644
+--- a/meshLibrary/utilities/meshes/partTetMesh/partTetMeshParallelAddressing.C
++++ b/meshLibrary/utilities/meshes/partTetMesh/partTetMeshParallelAddressing.C
+@@ -161,7 +161,7 @@ void partTetMesh::createParallelAddressing
+     nSharedPoints -= nLocalPoints;
+     nPointsAtProc[Pstream::myProcNo()] = points_.size() - nSharedPoints;
+     Pstream::gatherList(nPointsAtProc);
+-    Pstream::broadcastList(nPointsAtProc);
++    Pstream::scatter(nPointsAtProc);
+     
+     for(label i=0;i<Pstream::myProcNo();++i)
+         startPoint += nPointsAtProc[i];
+diff --git a/meshLibrary/utilities/meshes/partTriMesh/partTriMeshParallelAddressing.C b/meshLibrary/utilities/meshes/partTriMesh/partTriMeshParallelAddressing.C
+index 850cc38..4f896a4 100644
+--- a/meshLibrary/utilities/meshes/partTriMesh/partTriMeshParallelAddressing.C
++++ b/meshLibrary/utilities/meshes/partTriMesh/partTriMeshParallelAddressing.C
+@@ -164,7 +164,7 @@ void partTriMesh::createParallelAddressing
+     nSharedPoints -= nLocalPoints;
+     nPointsAtProc[Pstream::myProcNo()] = pts.size() - nSharedPoints;
+     Pstream::gatherList(nPointsAtProc);
+-    Pstream::broadcastList(nPointsAtProc);
++    Pstream::scatter(nPointsAtProc);
+ 
+     for(label i=0;i<Pstream::myProcNo();++i)
+         startPoint += nPointsAtProc[i];
+diff --git a/meshLibrary/utilities/meshes/polyMeshGen/polyMeshGen.C b/meshLibrary/utilities/meshes/polyMeshGen/polyMeshGen.C
+index 6d625b5..ddefc9a 100644
+--- a/meshLibrary/utilities/meshes/polyMeshGen/polyMeshGen.C
++++ b/meshLibrary/utilities/meshes/polyMeshGen/polyMeshGen.C
+@@ -28,6 +28,7 @@ Description
+ #include "polyMeshGen.H"
+ #include "demandDrivenData.H"
+ #include "OFstream.H"
++#include "OSspecific.H"
+ 
+ namespace Foam
+ {
+diff --git a/meshLibrary/utilities/meshes/polyMeshGen/polyMeshGenFaces.C b/meshLibrary/utilities/meshes/polyMeshGen/polyMeshGenFaces.C
+index de2740a..566b4bf 100644
+--- a/meshLibrary/utilities/meshes/polyMeshGen/polyMeshGenFaces.C
++++ b/meshLibrary/utilities/meshes/polyMeshGen/polyMeshGenFaces.C
+@@ -248,7 +248,7 @@ labelList polyMeshGenFaces::findPatches(const word& patchName) const
+ {
+     wordList allPatches = patchNames();
+ 
+-    regExpCxx check(patchName);
++    regExp check(patchName);
+ 
+     labelList patchIDs = findStrings(check, allPatches);
+ 
+diff --git a/meshLibrary/utilities/meshes/polyMeshGenAddressing/polyMeshGenAddressingParallelAddressing.C b/meshLibrary/utilities/meshes/polyMeshGenAddressing/polyMeshGenAddressingParallelAddressing.C
+index fdb9df9..5b603ea 100644
+--- a/meshLibrary/utilities/meshes/polyMeshGenAddressing/polyMeshGenAddressingParallelAddressing.C
++++ b/meshLibrary/utilities/meshes/polyMeshGenAddressing/polyMeshGenAddressingParallelAddressing.C
+@@ -200,7 +200,7 @@ void polyMeshGenAddressing::calcGlobalPointLabels() const
+     labelList nPointsAtProc(Pstream::nProcs());
+     nPointsAtProc[Pstream::myProcNo()] = nLocalPoints;
+     Pstream::gatherList(nPointsAtProc);
+-    Pstream::broadcastList(nPointsAtProc);
++    Pstream::scatter(nPointsAtProc);
+     for(label i=0;i<Pstream::myProcNo();++i)
+         startPoint += nPointsAtProc[i];
+ 
+@@ -321,7 +321,7 @@ void polyMeshGenAddressing::calcGlobalFaceLabels() const
+     numberOfInternalFaces[Pstream::myProcNo()] = nIntFaces + nBoundaryFaces;
+ 
+     Pstream::gatherList(numberOfInternalFaces);
+-    Pstream::broadcastList(numberOfInternalFaces);
++    Pstream::scatter(numberOfInternalFaces);
+     for(label i=0;i<Pstream::myProcNo();++i)
+         startFace += numberOfInternalFaces[i];
+ 
+@@ -387,7 +387,7 @@ void polyMeshGenAddressing::calcGlobalFaceLabels() const
+             boundaries[patchI].patchSize();
+     }
+     Pstream::gatherList(numberOfBoundaryFaces);
+-    Pstream::broadcastList(numberOfBoundaryFaces);
++    Pstream::scatter(numberOfBoundaryFaces);
+ 
+     forAll(boundaries, patchI)
+     {
+@@ -420,7 +420,7 @@ void polyMeshGenAddressing::calcGlobalCellLabels() const
+     labelList nCellsAtProc(Pstream::nProcs());
+     nCellsAtProc[Pstream::myProcNo()] = globalCellLabel.size();
+     Pstream::gatherList(nCellsAtProc);
+-    Pstream::broadcastList(nCellsAtProc);
++    Pstream::scatter(nCellsAtProc);
+     for(label i=0;i<Pstream::myProcNo();++i)
+         startLabel += nCellsAtProc[i];
+ 
+@@ -602,7 +602,7 @@ void polyMeshGenAddressing::calcGlobalEdgeLabels() const
+     labelList nEdgesAtProc(Pstream::nProcs());
+     nEdgesAtProc[Pstream::myProcNo()] = nLocalEdges;
+     Pstream::gatherList(nEdgesAtProc);
+-    Pstream::broadcastList(nEdgesAtProc);
++    Pstream::scatter(nEdgesAtProc);
+     for(label i=0;i<Pstream::myProcNo();++i)
+         startEdge += nEdgesAtProc[i];
+ 
+diff --git a/meshLibrary/utilities/meshes/primitives/partTet/partTetI.H b/meshLibrary/utilities/meshes/primitives/partTet/partTetI.H
+index 550888d..6ed633c 100644
+--- a/meshLibrary/utilities/meshes/primitives/partTet/partTetI.H
++++ b/meshLibrary/utilities/meshes/primitives/partTet/partTetI.H
+@@ -178,7 +178,7 @@ inline point partTet::crcmCentre(const PointField& points) const
+         points[data_[3]]
+     );
+ 
+-    return tet.circumCentre();
++    return tet.circumSphere().first();
+ }
+ 
+ template<class PointField>
+@@ -192,7 +192,7 @@ inline scalar partTet::crcmRadius(const PointField& points) const
+         points[data_[3]]
+     );
+ 
+-    return tet.circumRadius();
++    return tet.circumSphere().second();
+ }
+ 
+ template<class PointField>
+diff --git a/meshLibrary/utilities/meshes/triSurf/triSurfFacets.C b/meshLibrary/utilities/meshes/triSurf/triSurfFacets.C
+index 1a05950..ece2938 100644
+--- a/meshLibrary/utilities/meshes/triSurf/triSurfFacets.C
++++ b/meshLibrary/utilities/meshes/triSurf/triSurfFacets.C
+@@ -89,7 +89,7 @@ labelList triSurfFacets::findPatches(const word& patchName) const
+ {
+     const wordList allPatches = patchNames();
+ 
+-    regExpCxx checker(patchName);
++    regExp checker(patchName);
+ 
+     const labelList patchIDs = findStrings(checker, allPatches);
+ 
+diff --git a/meshLibrary/utilities/octrees/meshOctree/meshOctreeAddressing/meshOctreeAddressingParallelAddressing.C b/meshLibrary/utilities/octrees/meshOctree/meshOctreeAddressing/meshOctreeAddressingParallelAddressing.C
+index eb8c77b..bc3300b 100644
+--- a/meshLibrary/utilities/octrees/meshOctree/meshOctreeAddressing/meshOctreeAddressingParallelAddressing.C
++++ b/meshLibrary/utilities/octrees/meshOctree/meshOctreeAddressing/meshOctreeAddressingParallelAddressing.C
+@@ -121,7 +121,7 @@ void meshOctreeAddressing::calcGlobalPointLabels() const
+ 
+     //- exchange data with other processors
+     Pstream::gatherList(nLocalPoints);
+-    Pstream::broadcastList(nLocalPoints);
++    Pstream::scatter(nLocalPoints);
+ 
+     //- find the starting point label
+     label startPoint(0);
+@@ -379,7 +379,7 @@ void meshOctreeAddressing::calcGlobalLeafLabels() const
+ 
+     //- exchange the data with other processors
+     Pstream::gatherList(nLeavesAtProc);
+-    Pstream::broadcastList(nLeavesAtProc);
++    Pstream::scatter(nLeavesAtProc);
+ 
+     //- find the starting labels for
+     nLeaves = 0;
+diff --git a/meshLibrary/utilities/octrees/meshOctree/meshOctreeCreator/meshOctreeCreatorAdjustOctreeToSurface.C b/meshLibrary/utilities/octrees/meshOctree/meshOctreeCreator/meshOctreeCreatorAdjustOctreeToSurface.C
+index aa022dd..9206b13 100644
+--- a/meshLibrary/utilities/octrees/meshOctree/meshOctreeCreator/meshOctreeCreatorAdjustOctreeToSurface.C
++++ b/meshLibrary/utilities/octrees/meshOctree/meshOctreeCreator/meshOctreeCreatorAdjustOctreeToSurface.C
+@@ -214,7 +214,7 @@ void meshOctreeCreator::refineBoxesContainedInObjects()
+         forAll(refObjects, objectI)
+         {
+             const entry& objectEntry =
+-                dict.lookupEntry(objectNames[objectI], keyType::REGEX);
++                dict.lookupEntry(objectNames[objectI], false, true);
+ 
+             refObjects.set
+             (
+diff --git a/meshLibrary/utilities/octrees/meshOctree/meshOctreeModifier/meshOctreeModifierLoadDistribution.C b/meshLibrary/utilities/octrees/meshOctree/meshOctreeModifier/meshOctreeModifierLoadDistribution.C
+index 86ee1b3..3b4fc27 100644
+--- a/meshLibrary/utilities/octrees/meshOctree/meshOctreeModifier/meshOctreeModifierLoadDistribution.C
++++ b/meshLibrary/utilities/octrees/meshOctree/meshOctreeModifier/meshOctreeModifierLoadDistribution.C
+@@ -127,7 +127,7 @@ void meshOctreeModifier::loadDistribution(const direction usedType)
+     labelList procWeights(Pstream::nProcs());
+     procWeights[Pstream::myProcNo()] = localNumWeighs;
+     Pstream::gatherList(procWeights);
+-    Pstream::broadcastList(procWeights);
++    Pstream::scatter(procWeights);
+ 
+     for(label procI=0;procI<Pstream::myProcNo();++procI)
+         doBalancing += procWeights[procI];
+@@ -197,7 +197,7 @@ void meshOctreeModifier::loadDistribution(const direction usedType)
+         sendToProcesssors[Pstream::myProcNo()][counter++] = it->first;
+ 
+     Pstream::gatherList(sendToProcesssors);
+-    Pstream::broadcastList(sendToProcesssors);
++    Pstream::scatter(sendToProcesssors);
+ 
+     labelHashSet receiveFrom;
+     forAll(sendToProcesssors, procI)
+diff --git a/meshLibrary/utilities/octrees/meshOctree/meshOctreeModifier/meshOctreeModifierUpdateCommunicationPattern.C b/meshLibrary/utilities/octrees/meshOctree/meshOctreeModifier/meshOctreeModifierUpdateCommunicationPattern.C
+index aa53adf..b69aec0 100644
+--- a/meshLibrary/utilities/octrees/meshOctree/meshOctreeModifier/meshOctreeModifierUpdateCommunicationPattern.C
++++ b/meshLibrary/utilities/octrees/meshOctree/meshOctreeModifier/meshOctreeModifierUpdateCommunicationPattern.C
+@@ -60,7 +60,7 @@ void meshOctreeModifier::updateCommunicationPattern()
+ 
+     //- communicate missing ranges
+     Pstream::gatherList(range);
+-    Pstream::broadcastList(range);
++    Pstream::scatter(range);
+ 
+     //- find missing child cubes in the tree. These coordinates are located on
+     //- other processors, and they must fit in the range of cubes located
+diff --git a/meshLibrary/utilities/surfaceTools/meshSurfaceEngine/meshSurfaceEngineParallelAddressing.C b/meshLibrary/utilities/surfaceTools/meshSurfaceEngine/meshSurfaceEngineParallelAddressing.C
+index bb3b769..55d5cf4 100644
+--- a/meshLibrary/utilities/surfaceTools/meshSurfaceEngine/meshSurfaceEngineParallelAddressing.C
++++ b/meshLibrary/utilities/surfaceTools/meshSurfaceEngine/meshSurfaceEngineParallelAddressing.C
+@@ -205,7 +205,7 @@ void meshSurfaceEngine::calcGlobalBoundaryPointLabels() const
+     labelList nPointsAtProc(Pstream::nProcs());
+     nPointsAtProc[Pstream::myProcNo()] = nLocalPoints;
+     Pstream::gatherList(nPointsAtProc);
+-    Pstream::broadcastList(nPointsAtProc);
++    Pstream::scatter(nPointsAtProc);
+     for(label i=0;i<Pstream::myProcNo();++i)
+         startPoint += nPointsAtProc[i];
+ 
+@@ -533,7 +533,7 @@ void meshSurfaceEngine::calcGlobalBoundaryEdgeLabels() const
+     labelList nEdgesAtProc(Pstream::nProcs());
+     nEdgesAtProc[Pstream::myProcNo()] = nLocalEdges;
+     Pstream::gatherList(nEdgesAtProc);
+-    Pstream::broadcastList(nEdgesAtProc);
++    Pstream::scatter(nEdgesAtProc);
+     for(label i=0;i<Pstream::myProcNo();++i)
+         startEdge += nEdgesAtProc[i];
+ 
+@@ -781,7 +781,7 @@ void meshSurfaceEngine::calcGlobalBoundaryFaceLabels() const
+     labelList nFacesAtProc(Pstream::nProcs());
+     nFacesAtProc[Pstream::myProcNo()] = bFaces.size();
+     Pstream::gatherList(nFacesAtProc);
+-    Pstream::broadcastList(nFacesAtProc);
++    Pstream::scatter(nFacesAtProc);
+ 
+     label startFace(0);
+     for(label i=0;i<Pstream::myProcNo();++i)
+diff --git a/meshLibrary/utilities/surfaceTools/renameBoundaryPatches/renameBoundaryPatches.C b/meshLibrary/utilities/surfaceTools/renameBoundaryPatches/renameBoundaryPatches.C
+index 0c91398..e7b8143 100644
+--- a/meshLibrary/utilities/surfaceTools/renameBoundaryPatches/renameBoundaryPatches.C
++++ b/meshLibrary/utilities/surfaceTools/renameBoundaryPatches/renameBoundaryPatches.C
+@@ -86,7 +86,8 @@ void renameBoundaryPatches::calculateNewBoundary()
+                     newPatchNames.lookupEntry
+                     (
+                         keys[patchI],
+-                        keyType::REGEX
++                        false,
++                        true
+                     ).clone()
+                 );
+         }
+diff --git a/utilities/FMSToVTK/FMSToVTK.C b/utilities/FMSToVTK/FMSToVTK.C
+index f37b39e..6a229f1 100644
+--- a/utilities/FMSToVTK/FMSToVTK.C
++++ b/utilities/FMSToVTK/FMSToVTK.C
+@@ -33,6 +33,7 @@ Author
+ #include "argList.H"
+ #include "autoPtr.H"
+ #include "OFstream.H"
++#include "OSspecific.H"
+ #include "triSurf.H"
+ #include "triSurfModifier.H"
+ #include "xmlTag.H"
+diff --git a/utilities/preparePar/preparePar.C b/utilities/preparePar/preparePar.C
+index 27aca6b..3d44015 100644
+--- a/utilities/preparePar/preparePar.C
++++ b/utilities/preparePar/preparePar.C
+@@ -31,6 +31,7 @@ Description
+ 
+ #include "argList.H"
+ #include "polyMeshGen.H"
++#include "OSspecific.H"
+ 
+ #include <sstream>
+ 

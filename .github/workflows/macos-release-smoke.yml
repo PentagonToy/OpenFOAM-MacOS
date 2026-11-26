@@ -1,0 +1,46 @@
+name: Verify signed macOS release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  smoke-test:
+    runs-on: macos-15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Verify and run the published app
+        shell: bash
+        run: |
+          out="$RUNNER_TEMP/openfoam-release"
+          mkdir -p "$out"
+          gh release download "$GITHUB_REF_NAME" --pattern 'openfoam-*-arm64.dmg' --dir "$out"
+          dmg=("$out"/openfoam-*-arm64.dmg)
+          xcrun stapler validate "${dmg[0]}"
+          hdiutil attach -readonly -nobrowse -mountpoint "$out/installer" "${dmg[0]}"
+          app="$out/OpenFOAM-14.app"
+          ditto "$out/installer/OpenFOAM-14.app" "$app"
+          hdiutil detach "$out/installer"
+          codesign --verify --deep --strict "$app"
+          xcrun stapler validate "$app"
+          launcher="$app/Contents/Resources/openfoam-14"
+          test "$("$app/Contents/MacOS/OpenFOAM-14.command" --version)" = "$("$launcher" --version)"
+          scripts/smoke-test.sh "$launcher" "$out"
+          "$launcher" --eject
+
+      - name: Save case logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: openfoam-release-smoke-logs
+          path: ${{ runner.temp }}/openfoam-release/cavity.*/**/log.*
+          if-no-files-found: ignore

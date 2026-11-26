@@ -1,0 +1,47 @@
+--- a/src/OSspecific/POSIX/POSIX.C
++++ b/src/OSspecific/POSIX/POSIX.C
+@@ -63,6 +63,7 @@
+ #endif
+
+ #include <netinet/in.h>
++#include <sstream>
+
+ // * * * * * * * * * * * * * * Static Data Members * * * * * * * * * * * * * //
+
+@@ -1252,9 +1253,12 @@
+     }
+     void* handle = ::dlopen(lib.c_str(), RTLD_LAZY|RTLD_GLOBAL);
+ #if defined(darwin64)
+-    if (handle == nullptr && lib.ext() == "so")
++    const fileName nativeLib = lib.ext() == "so"
++      ? fileName(lib.lessExt() + ".dylib")
++      : lib;
++    if (!handle && nativeLib != lib)
+     {
+-        fileName fallback_lib = lib.lessExt() + ".dylib";
++        const fileName& fallback_lib = nativeLib;
+         if (check)
+         {
+             WarningIn("dlOpen(const fileName&, const bool)")
+@@ -1264,6 +1268,21 @@
+         }
+         handle = ::dlopen(fallback_lib.c_str(), RTLD_LAZY|RTLD_GLOBAL);
+     }
++
++    // macOS system shells can strip DYLD_LIBRARY_PATH from child processes.
++    if (!handle && nativeLib.find('/') == string::npos)
++    {
++        std::istringstream directories(getEnv("FOAM_DYLD_LIBRARY_PATH"));
++        std::string directory;
++        while (!handle && std::getline(directories, directory, ':'))
++        {
++            if (!directory.empty())
++            {
++                const std::string path = directory + "/" + nativeLib;
++                handle = ::dlopen(path.c_str(), RTLD_LAZY|RTLD_GLOBAL);
++            }
++        }
++    }
+ #endif
+
+     if (!handle && check)

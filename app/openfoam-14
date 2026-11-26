@@ -1,0 +1,88 @@
+#!/bin/zsh -e
+
+resources="${0:A:h}"
+image="$resources/OpenFOAM-14.dmg"
+volume="/Volumes/OpenFOAM-14"
+
+case ${1:-} in
+    -h|--help)
+        cat <<'HELP'
+Usage: openfoam-14 [--] [COMMAND [ARG...]]
+       openfoam-14 --help | --version | --eject
+
+Start an interactive OpenFOAM 14 session or run a command in its environment.
+The first command mounts the bundled runtime. The CLI preserves command output
+and the exit status. Run --eject after all sessions have ended.
+HELP
+        exit 0 ;;
+    --version)
+        version=$(/usr/bin/plutil -extract CFBundleShortVersionString raw "$resources/../Info.plist")
+        print -r -- "OpenFOAM Foundation 14 (macOS package $version)"
+        exit 0 ;;
+    --)
+        shift
+        (( $# )) || { print -u2 "Provide a command after --."; exit 2; } ;;
+esac
+
+release_id=$(<"$resources/runtime-id")
+
+matches_runtime() {
+    [[ -f "$volume/.runtime-id" && "$(<"$volume/.runtime-id")" == "$release_id" ]]
+}
+
+if [[ ${1:-} == --eject ]]; then
+    if matches_runtime; then
+        exec /usr/sbin/diskutil eject "$volume"
+    fi
+    exit 0
+fi
+
+unset OPENFOAM14_PACKAGE_VERSION
+if (( $# == 0 )) && [[ -t 0 && -t 1 ]]; then
+    OPENFOAM14_PACKAGE_VERSION=$(/usr/bin/plutil -extract CFBundleShortVersionString raw "$resources/../Info.plist")
+    export OPENFOAM14_PACKAGE_VERSION
+    if (( ${COLUMNS:-80} >= 78 )); then
+        cat <<'BANNER'
+╭───────────────────┬────────────────────────────────────────────────────────╮
+│ ╭───────────────╮ │                                                        │
+│ │           ● ● │ │                                                        │
+│ │    ╭─────╮    │ │                  °°° OpenFOAM-14 °°°                   │
+│ │   ╱ °   ° ╲   │ │                                                        │
+│ │  │  °      │  │ │ Native OpenFOAM Foundation for macOS                   │
+│ │  │≈≈≈≈≈≈≈≈≈│  │ │ → https://github.com/PentagonToy/OpenFOAM-MacOS        │
+│ │   ╲≈≈≈≈≈≈≈╱   │ │                                                        │
+│ │    ╰─────╯    │ │                                                        │
+│ ╰───────────────╯ │                                                        │
+╰───────────────────┴────────────────────────────────────────────────────────╯
+BANNER
+    else
+        print -r -- "OpenFOAM-14"
+    fi
+fi
+
+if ! matches_runtime; then
+    if [[ -e "$volume" ]]; then
+        print -u2 "A different volume is mounted at $volume. Eject it before starting OpenFOAM 14."
+        exit 1
+    fi
+    if ! /usr/bin/hdiutil attach -quiet -readonly -mountpoint "$volume" "$image" >&2; then
+        matches_runtime || exit 1
+    fi
+    matches_runtime || {
+        print -u2 "The mounted volume does not match this OpenFOAM 14 app."
+        exit 1
+    }
+fi
+
+# Keep the mounted directory open for the lifetime of the session.
+exec {volume_fd}<"$volume"
+export OPENFOAM14_ROOT="$volume"
+if (( $# )); then
+    exec /bin/bash --noprofile --norc -c '
+        source "$1" >&2 || exit
+        shift
+        exec "$@"
+    ' openfoam-14 "$resources/session.bash" "$@"
+fi
+export BASH_SILENCE_DEPRECATION_WARNING=1
+exec /bin/bash --noprofile --rcfile "$resources/session.bash" -i
